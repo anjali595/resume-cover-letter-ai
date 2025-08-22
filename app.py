@@ -308,6 +308,50 @@ if st.button("Generate tailored resume & cover letter"):
 st.markdown("---")
 st.markdown("**Notes & tips**: The app runs entirely locally. To enable a richer LLM-driven tailoring, download a seq2seq model (e.g. Flan-T5) and place it under `models/generator` (or point the sidebar to your fine-tuned model path). If no model is present the app uses deterministic templates + matching which works offline and reliably.")
 
+import streamlit as st
+import sqlite3
+
+# Initialize DB for user accounts
+conn = sqlite3.connect("users.db")
+c = conn.cursor()
+c.execute("""CREATE TABLE IF NOT EXISTS users (
+    email TEXT PRIMARY KEY,
+    premium INTEGER DEFAULT 0,
+    generations INTEGER DEFAULT 0
+)""")
+conn.commit()
+
+# Example user session
+if "email" not in st.session_state:
+    st.session_state.email = None
+if "premium" not in st.session_state:
+    st.session_state.premium = False
+if "generations" not in st.session_state:
+    st.session_state.generations = 0
+#premiumship
+st.sidebar.title("Account")
+email = st.sidebar.text_input("Enter Email")
+if email:
+    st.session_state.email = email
+    c.execute("SELECT premium, generations FROM users WHERE email=?", (email,))
+    row = c.fetchone()
+    if row:
+        st.session_state.premium, st.session_state.generations = row
+    else:
+        c.execute("INSERT INTO users (email) VALUES (?)", (email,))
+        conn.commit()
+
+if st.session_state.premium:
+    st.sidebar.success("✅ Premium Member")
+else:
+    st.sidebar.warning("🔒 Free Tier — Upgrade to Premium")
+    if st.sidebar.button("Upgrade Now"):
+        st.write("[Click here to pay with Stripe](https://buy.stripe.com/test_examplelink)")
+
+# Usage limit for free tier
+if not st.session_state.premium and st.session_state.generations >= 3:
+    st.error("You’ve reached your free limit. Upgrade to Premium for unlimited access.")
+    st.stop()
 
 
 
