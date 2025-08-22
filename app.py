@@ -214,7 +214,7 @@ Context & Constraints:
 
 Candidate Profile (Resume/LinkedIn):
 """
-    + req.candidate_text.strip() + "\n\n" + "Job Description:\n" + req.job_text.strip() + "\n\n" + "Output:")
+    + req.candidate_text.strip() + "\n\n" + "Job Description:\n" + req.job_text.strip() + "\n\n" + "Output:"
 
 
 # --------- LLM call wrappers ---------
@@ -538,3 +538,4 @@ with st.expander("🔐 Notes on Privacy & PII"):
         "- Use the **Anonymize PII** toggle to scrub names, emails, and phone numbers in outputs.\n"
         "- Review drafts for accuracy before sending to employers.\n"
     )
+
