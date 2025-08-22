@@ -5,3 +5,8 @@ transformers>=4.30.0    # optional; required for local LLM mode
 sentence-transformers  # optional; required for semantic matching
 torch                  # optional; required for running local transformers
 sentencepiece          # sometimes required by tokenizer models
+streamlit
+reportlab
+razorpay
+
+
