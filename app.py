@@ -1,544 +1,313 @@
-"""
-AI-Powered Resume & Cover Letter Generator
------------------------------------------
-A Streamlit app where users upload a resume (PDF/DOCX) or paste their LinkedIn profile,
-paste a job description, and receive a tailored resume version and a customized cover letter.
-
-Features
-- Upload resume (PDF/DOCX) or paste LinkedIn/profile text
-- Paste job description text or upload JD file (PDF/TXT)
-- Tone, industry, seniority, and role selectors
-- Team presets (upload JSON) to fine-tune behavior by industry/role
-- One-click: Analyze Fit, Tailor Resume, Generate Cover Letter
-- Download as DOCX or Markdown
-- Optional anonymization / PII scrubbing
-
-How to run locally
-------------------
-1) Save this file as `app.py`.
-2) Create and activate a virtual environment (optional but recommended).
-3) `pip install -r requirements.txt` (see requirements block at bottom of this file)
-4) Set your OpenAI API key in the environment: `export OPENAI_API_KEY=your_key`
-5) `streamlit run app.py`
-
-Note: For Google AI Studio (Gemini) support, set `PROVIDER = "google"` and
-provide `GOOGLE_API_KEY`. By default this file uses OpenAI. Both providers
-share the same UI.
-"""
-
-import io
-import json
-import os
-import openai
-import re
-import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
+# app.py
 import streamlit as st
+from io import BytesIO
+import os
+import re
+import base64
+from typing import List, Dict
+from pathlib import Path
 
-# -------- Optional LLM providers --------
-openai.api_key = os.getenv("OPENAI_API_KEY")
-PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()  # "openai" or "google"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash-exp")
+# Parsing libs
+import pdfplumber
+import docx
+from docx import Document
 
-# Lazy imports so the app can start even if a provider isn't installed
-_openai_client = None
-_google_client = None
+# Text processing / optional ML libs
+try:
+    from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
+    TRANSFORMERS_AVAILABLE = True
+except Exception:
+    TRANSFORMERS_AVAILABLE = False
 
+try:
+    from sentence_transformers import SentenceTransformer, util
+    SBT_AVAILABLE = True
+except Exception:
+    SBT_AVAILABLE = False
 
-def get_openai_client():
-    global _openai_client
-    if _openai_client is None:
+# ---------- Configuration ----------
+MODEL_DIR = Path("models/generator")  # put a transformers-compatible model here for LLM mode
+EMBEDDING_MODEL_DIR = Path("models/embeddings")  # optional sentence-transformers model
+# A small packed skills list (extendable)
+COMMON_SKILLS = [
+    "Python","Java","C++","SQL","JavaScript","HTML","CSS","React","Node.js","Django",
+    "Flask","Machine Learning","Deep Learning","NLP","TensorFlow","PyTorch","Pandas",
+    "Scikit-learn","Git","AWS","GCP","Azure","Docker","Kubernetes","CI/CD","Agile",
+    "Scrum","Leadership","Communication","Excel","Tableau","Power BI"
+]
+
+st.set_page_config(page_title="AI Resume & Cover Letter Generator — Local", page_icon="📄", layout="wide")
+
+# ---------- Helpers ----------
+def read_pdf(file_bytes: bytes) -> str:
+    text = []
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text.append(page_text)
+    return "\n".join(text)
+
+def read_docx(file_bytes: bytes) -> str:
+    doc = docx.Document(BytesIO(file_bytes))
+    return "\n".join([p.text for p in doc.paragraphs])
+
+def extract_text_from_upload(uploaded_file) -> str:
+    content = uploaded_file.read()
+    if uploaded_file.name.lower().endswith(".pdf"):
+        return read_pdf(content)
+    elif uploaded_file.name.lower().endswith(".docx") or uploaded_file.name.lower().endswith(".doc"):
+        return read_docx(content)
+    else:
+        # assume plain text
         try:
-            from openai import OpenAI
-            _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        except Exception as e:
-            st.error(f"OpenAI client not available: {e}")
-    return _openai_client
+            return content.decode("utf-8")
+        except Exception:
+            return ""
 
+def simple_skill_extraction(text: str, skills_list: List[str]) -> List[str]:
+    found = []
+    txt = text.lower()
+    for s in skills_list:
+        if s.lower() in txt:
+            found.append(s)
+    # dedupe and maintain order
+    seen = set()
+    ordered = []
+    for s in found:
+        if s not in seen:
+            ordered.append(s)
+            seen.add(s)
+    return ordered
 
-def get_google_client():
-    global _google_client
-    if _google_client is None:
+def highlight_relevant_sentences(resume_text: str, jd_text: str, top_k: int = 6) -> List[str]:
+    """
+    If sentence-transformers available, do semantic similarity; otherwise simple keyword overlap.
+    """
+    if SBT_AVAILABLE and EMBEDDING_MODEL_DIR.exists():
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            _google_client = genai.GenerativeModel(GOOGLE_MODEL)
-        except Exception as e:
-            st.error(f"Google Generative AI not available: {e}")
-    return _google_client
+            embedder = SentenceTransformer(str(EMBEDDING_MODEL_DIR))
+            resume_sents = [s.strip() for s in re.split(r'(?<=[.!?\n])\s+', resume_text) if len(s.strip())>10]
+            jd_emb = embedder.encode(jd_text, convert_to_tensor=True)
+            sent_embs = embedder.encode(resume_sents, convert_to_tensor=True)
+            cos_scores = util.cos_sim(jd_emb, sent_embs)[0]
+            top_idx = cos_scores.argsort(descending=True)[:top_k].cpu().tolist()
+            return [resume_sents[i] for i in top_idx]
+        except Exception:
+            pass
 
+    # fallback: keyword overlap ranking
+    jd_words = set(re.findall(r"\w+", jd_text.lower()))
+    sents = [s.strip() for s in re.split(r'(?<=[.!?\n])\s+', resume_text) if len(s.strip())>10]
+    scored = []
+    for s in sents:
+        words = set(re.findall(r"\w+", s.lower()))
+        score = len(words & jd_words)
+        if score > 0:
+            scored.append((score, s))
+    scored.sort(reverse=True)
+    return [s for _, s in scored[:top_k]]
 
-# --------- File helpers ---------
+def generate_template_cover_letter(name: str, role: str, company: str, top_skills: List[str], tone: str, bullet_points: List[str]) -> str:
+    # A strong, reusable template that produces decent output offline
+    intro = f"Dear {company} Hiring Team," if company else f"Dear Hiring Manager,"
+    skill_line = ""
+    if top_skills:
+        skill_line = f" I bring experience in {', '.join(top_skills[:3])} and a track record of delivering measurable results."
+    body = (
+        f"My name is {name}. I'm excited to apply for the {role} role at {company}." if name or company else f"I am excited to apply for the {role} role."
+    )
+    body += skill_line + f" I am particularly drawn to this opportunity because of the alignment between my experience and your needs."
 
-def extract_text_from_pdf(uploaded_file) -> str:
-    """Extracts text from a PDF using pdfminer.six."""
-    try:
-        from pdfminer.high_level import extract_text
-        with io.BytesIO(uploaded_file.read()) as f:
-            return extract_text(f) or ""
-    except Exception as e:
-        st.warning(f"PDF text extraction failed: {e}")
-        return ""
+    bullets = "\n".join([f"- {b}" for b in bullet_points]) if bullet_points else ""
+    closing = {
+        "professional": "Sincerely,\n" + (name or "Candidate"),
+        "friendly": "Best regards,\n" + (name or "Candidate"),
+        "confident": "Looking forward to contributing,\n" + (name or "Candidate")
+    }.get(tone, "Sincerely,\n" + (name or "Candidate"))
 
+    return f"{intro}\n\n{body}\n\nRelevant achievements:\n{bullets}\n\n{closing}"
 
-def extract_text_from_docx(uploaded_file) -> str:
-    try:
-        import docx
-        doc = docx.Document(uploaded_file)
-        return "\n".join([p.text for p in doc.paragraphs])
-    except Exception as e:
-        st.warning(f"DOCX text extraction failed: {e}")
-        return ""
+def call_local_llm(prompt: str, model_dir: Path, max_length: int = 512) -> str:
+    """
+    Use transformers pipeline on a local seq2seq model (e.g. Flan-T5). The user must download and place model files under model_dir.
+    This function gracefully fails back to template generation if no transformer available.
+    """
+    if not TRANSFORMERS_AVAILABLE or not model_dir.exists():
+        raise RuntimeError("Local model not available")
 
+    # Load pipeline (simple generate with seq2seq)
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    model = AutoModelForSeq2SeqLM.from_pretrained(str(model_dir))
+    gen = pipeline("text2text-generation", model=model, tokenizer=tokenizer, device=-1)
+    out = gen(prompt, max_length=max_length, truncation=True)
+    return out[0]["generated_text"]
 
-def read_text_file(uploaded_file) -> str:
-    try:
-        return uploaded_file.read().decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
+def build_tailoring_prompt(resume_text: str, jd_text: str, name: str, role: str, tone: str, instructions: str) -> str:
+    prompt = (
+        "You are a resume-tailoring assistant. Given the user's existing resume content and a job description, produce:\n"
+        "1) A tailored resume summary (2-4 sentences) highlighting most relevant skills and achievements.\n"
+        "2) A tailored cover letter (2 short paragraphs + closing).\n"
+        "3) 3 suggested bullet points to add to experience section tailored for the role.\n\n"
+        f"User name: {name}\n"
+        f"Target role: {role}\n"
+        f"Tone: {tone}\n"
+        f"Extra instructions: {instructions}\n\n"
+        "Job Description:\n" + jd_text + "\n\n"
+        "Resume Text:\n" + resume_text + "\n\n"
+        "Format the output clearly with headings: RESUME_SUMMARY, COVER_LETTER, SUGGESTED_BULLETS.\n"
+    )
+    return prompt
 
-
-# --------- Domain presets / Team profiles ---------
-DEFAULT_PRESETS = {
-    "Software Engineering": {
-        "tone": "confident",
-        "style": "ATS-friendly, bullet-first, quantitative impact",
-        "keywords": [
-            "Python", "Java", "C++", "System Design", "Microservices", "REST", "GraphQL",
-            "Docker", "Kubernetes", "AWS", "GCP", "CI/CD", "Unit Testing", "Agile", "Scrum",
-        ],
-    },
-    "Data Science": {
-        "tone": "analytical",
-        "style": "Results-focused, highlights experiments, metrics and business impact",
-        "keywords": [
-            "Pandas", "NumPy", "Scikit-learn", "TensorFlow", "PyTorch", "A/B Testing",
-            "Causal Inference", "SQL", "Airflow", "ML Ops", "LLMs", "RAG",
-        ],
-    },
-    "Product Management": {
-        "tone": "strategic",
-        "style": "Customer-centric, combines discovery and delivery outcomes",
-        "keywords": [
-            "Roadmapping", "OKRs", "Discovery", "User Research", "A/B Testing", "Analytics",
-            "Stakeholder Management", "GTM", "Monetization",
-        ],
-    },
-    "Sales": {
-        "tone": "persuasive",
-        "style": "Quota-crushing, pipeline management, enterprise wins",
-        "keywords": [
-            "Prospecting", "CRM", "Salesforce", "Enterprise Sales", "Negotiation", "Forecasting",
-            "Solution Selling", "MEDDIC",
-        ],
-    },
-}
-
-
-# --------- Prompting ---------
-BASE_SYSTEM_PROMPT = (
-    "You are a senior career coach and ATS optimization expert. "
-    "Given a candidate profile and a target job description, you will: "
-    "(1) Summarize the candidate's core strengths in the context of the role, "
-    "(2) Draft a tailored, ATS-friendly resume section-by-section, emphasizing quantifiable impact, "
-    "(3) Draft a concise cover letter with the requested tone, "
-    "(4) Ensure the content reflects regional spelling for the selected locale, avoids exaggeration, and remains truthful, "
-    "(5) Mirror keywords from the job description where appropriate without keyword stuffing, and "
-    "(6) Keep formatting simple (headings, bullet points, no tables)."
-)
-
-RESUME_TEMPLATE = (
-    "# Tailored Resume\n"
-    "## Header\n"
-    "<NAME> | <CITY, COUNTRY> | <EMAIL> | <PHONE> | <LINKEDIN/PORTFOLIO>\n\n"
-    "## Professional Summary\n"
-    "${summary}\n\n"
-    "## Core Skills\n"
-    "- ${skills}\n\n"
-    "## Experience\n"
-    "${experience}\n\n"
-    "## Education\n"
-    "${education}\n\n"
-    "## Certifications (optional)\n"
-    "${certifications}\n\n"
-    "## Projects (optional)\n"
-    "${projects}\n"
-)
-
-COVER_LETTER_TEMPLATE = (
-    "# Tailored Cover Letter\n\n"
-    "${greeting}\n\n"
-    "${opening}\n\n"
-    "${body}\n\n"
-    "${closing}\n\n"
-    "Sincerely,\n\n<NAME>"
-)
-
-
-@dataclass
-class GenerationRequest:
-    candidate_text: str
-    job_text: str
-    tone: str
-    industry: str
-    role: str
-    seniority: str
-    locale: str
-    extra_keywords: List[str]
-    style_overrides: Optional[str] = None
-    anonymize: bool = False
-
-
-def build_user_prompt(req: GenerationRequest) -> str:
-    keyline = ", ".join(req.extra_keywords) if req.extra_keywords else ""
-    return f"""
-You will create two outputs for the candidate:
-1) A tailored resume that follows the RESUME TEMPLATE sections and is ATS-friendly.
-2) A tailored cover letter that follows the COVER LETTER TEMPLATE and the tone requested.
-
-Context & Constraints:
-- Industry: {req.industry}
-- Target Role: {req.role}
-- Seniority: {req.seniority}
-- Locale/Spelling: {req.locale}
-- Desired Tone: {req.tone}
-- Extra keywords to weave in: {keyline}
-- If information is missing, infer sensibly but mark with <PLACEHOLDER>.
-- Avoid tables or images.
-- Use short, high-impact bullets with quantified outcomes (e.g., 23% growth, $1.2M ARR).
-- Mirror language from the job description without copying verbatim.
-- Respect truthfulness: never invent employers or degrees; suggest placeholders instead.
-- Provide both artifacts in GitHub-flavored Markdown.
-- If anonymize=True, remove PII like full name, phone, personal email; use <REDACTED>.
-
-Candidate Profile (Resume/LinkedIn):
-"""
-    + req.candidate_text.strip() + "\n\n" + "Job Description:\n" + req.job_text.strip() + "\n\n" + "Output:"
-
-
-# --------- LLM call wrappers ---------
-
-def call_openai(system: str, user: str) -> str:
-    client = get_openai_client()
-    if not client:
-        raise RuntimeError("OpenAI client not initialized. Set OPENAI_API_KEY.")
-    try:
-        # Prefer the Responses API when available
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return resp.output_text
-    except Exception:
-        # Fallback: Chat Completions (for older models)
-        try:
-            chat = client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.3,
-            )
-            return chat.choices[0].message.content
-        except Exception as e:
-            raise RuntimeError(f"OpenAI generation failed: {e}")
-
-
-def call_google(system: str, user: str) -> str:
-    model = get_google_client()
-    if not model:
-        raise RuntimeError("Google Generative AI client not initialized. Set GOOGLE_API_KEY.")
-    try:
-        full_prompt = f"System Instructions:\n{system}\n\nUser:\n{user}"
-        resp = model.generate_content(full_prompt)
-        return resp.text or ""
-    except Exception as e:
-        raise RuntimeError(f"Google generation failed: {e}")
-
-
-def generate_outputs(req: GenerationRequest) -> str:
-    system = BASE_SYSTEM_PROMPT
-    user = build_user_prompt(req)
-    if PROVIDER == "google":
-        return call_google(system, user)
-    return call_openai(system, user)
-
-
-# --------- Rendering / Export ---------
-
-def split_outputs(md_text: str) -> Tuple[str, str]:
-    """Heuristically split markdown into resume and cover letter blocks."""
-    # Look for headings
-    resume_idx = re.search(r"#\s*Tailored Resume", md_text, flags=re.I)
-    cover_idx = re.search(r"#\s*Tailored Cover Letter", md_text, flags=re.I)
-    if resume_idx and cover_idx:
-        if resume_idx.start() < cover_idx.start():
-            return md_text[resume_idx.start():cover_idx.start()].strip(), md_text[cover_idx.start():].strip()
-        else:
-            return md_text[cover_idx.start():resume_idx.start()].strip(), md_text[resume_idx.start():].strip()
-    # Fallback: naive split by first big heading
-    parts = re.split(r"\n#\s+", md_text, maxsplit=1)
-    if len(parts) == 2:
-        first = parts[0].strip()
-        second = parts[1].strip()
-        if "cover" in second.lower():
-            return first, "# " + second
-        return "# " + second, first
-    return md_text.strip(), ""
-
-
-def to_docx(md_text: str) -> bytes:
-    """Very simple Markdown-to-DOCX by stripping markdown and writing paragraphs."""
-    try:
-        import docx
-    except Exception:
-        st.warning("python-docx not installed; cannot export DOCX.")
-        return b""
-
-    # Basic cleanup: remove markdown symbols but keep bullets
-    plain = re.sub(r"^#.*$", "", md_text, flags=re.M)
-    plain = re.sub(r"\*\*(.*?)\*\*", r"\1", plain)
-    plain = re.sub(r"_(.*?)_", r"\1", plain)
-
-    doc = docx.Document()
-    for line in plain.splitlines():
-        if line.strip().startswith(('-', '*')):
-            p = doc.add_paragraph()
-            p.style = 'List Bullet'
-            p.add_run(line.strip().lstrip('-* ').strip())
-        else:
-            doc.add_paragraph(line)
-    bio = io.BytesIO()
+def create_docx_resume(original_text: str, tailored_summary: str, suggested_bullets: List[str]) -> bytes:
+    doc = Document()
+    doc.add_heading("Tailored Resume", level=1)
+    doc.add_paragraph(tailored_summary)
+    doc.add_paragraph("Suggested bullet points to include:")
+    for b in suggested_bullets:
+        doc.add_paragraph(b, style='List Bullet')
+    doc.add_page_break()
+    doc.add_heading("Original / Parsed Resume Text", level=2)
+    for para in original_text.splitlines():
+        if para.strip():
+            doc.add_paragraph(para)
+    bio = BytesIO()
     doc.save(bio)
-    return bio.getvalue()
+    bio.seek(0)
+    return bio.read()
 
+def make_download_link(file_bytes: bytes, filename: str, label: str):
+    b64 = base64.b64encode(file_bytes).decode()
+    href = f'<a download="{filename}" href="data:application/octet-stream;base64,{b64}">{label}</a>'
+    return href
 
-# --------- UI ---------
-st.set_page_config(page_title="AI Resume & Cover Letter Generator", page_icon="🧰", layout="wide")
+# ---------- UI ----------
+st.markdown(
+    """
+    <style>
+    .stApp { background: linear-gradient(180deg,#f7fbff,#ffffff); }
+    .header { display:flex; align-items:center; gap:16px; }
+    .card { padding:18px; border-radius:12px; box-shadow: 0 6px 18px rgba(16,24,40,0.06); background: white; }
+    </style>
+    """, unsafe_allow_html=True)
 
-st.title("🧰 AI-Powered Resume & Cover Letter Generator")
-st.caption("Upload your resume or paste LinkedIn text, add a job description, and get tailored outputs.")
-
-with st.sidebar:
-    st.header("Settings")
-    st.write("**Provider**: set via `LLM_PROVIDER` env var (openai/google)")
-
-    if PROVIDER == "google":
-        st.text_input("GOOGLE_API_KEY", type="password", value=os.getenv("GOOGLE_API_KEY", ""))
-    else:
-        st.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-
-    model_name = st.text_input(
-        "Model name",
-        value=GOOGLE_MODEL if PROVIDER == "google" else OPENAI_MODEL,
-        help="Override the default model if desired.",
-    )
-    if PROVIDER == "google":
-        os.environ["GOOGLE_MODEL"] = model_name
-    else:
-        os.environ["OPENAI_MODEL"] = model_name
-
-    st.divider()
-    st.subheader("Team Presets")
-    preset_choice = st.selectbox("Select industry preset", list(DEFAULT_PRESETS.keys()))
-    uploaded_preset = st.file_uploader("Or upload a JSON team preset", type=["json"], accept_multiple_files=False)
-
-    presets = DEFAULT_PRESETS.copy()
-    if uploaded_preset is not None:
-        try:
-            custom = json.loads(uploaded_preset.read().decode("utf-8"))
-            # merge (uploaded overrides defaults on matching keys)
-            presets.update(custom)
-        except Exception as e:
-            st.warning(f"Failed to parse preset JSON: {e}")
-
-    selected_preset = presets.get(preset_choice, {})
-
-st.subheader("1) Candidate Profile")
-col1, col2 = st.columns(2)
+col1, col2 = st.columns([1,2])
 with col1:
-    resume_file = st.file_uploader("Upload Resume (PDF/DOCX/TXT)", type=["pdf", "docx", "txt"])
+    st.image("https://raw.githubusercontent.com/samkreter/sample-assets/main/resume.png", width=160) if st.button("Load demo image (optional)") else None
+
 with col2:
-    linked_text = st.text_area(
-        "Or paste LinkedIn / profile text",
-        height=180,
-        placeholder="Paste your LinkedIn 'About', Experience, Skills sections, or any profile text...",
-    )
+    st.markdown("<div class='header'><h1>AI Resume & Cover Letter Generator — Local</h1></div>", unsafe_allow_html=True)
+    st.markdown("Upload resume (PDF/DOCX/TXT) or paste LinkedIn profile. Provide the Job Description and get a tailored resume + cover letter. Runs offline — works even without an LLM model (template fallback).")
 
-candidate_text = ""
-if resume_file is not None:
-    if resume_file.name.lower().endswith('.pdf'):
-        candidate_text = extract_text_from_pdf(resume_file)
-    elif resume_file.name.lower().endswith('.docx'):
-        candidate_text = extract_text_from_docx(resume_file)
+st.sidebar.title("Settings & Mode")
+use_local_llm = False
+if MODEL_DIR.exists() and TRANSFORMERS_AVAILABLE:
+    use_local_llm = st.sidebar.checkbox("Enable local LLM (if model present)", value=True)
+else:
+    st.sidebar.info("No local generator model found or transformers not installed. App will use offline template mode.")
+st.sidebar.markdown("**Tone**")
+tone = st.sidebar.selectbox("Select tone", ["professional","friendly","confident"])
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Team / Fine-tune**")
+fine_tune_path = st.sidebar.text_input("Path to team fine-tuned model (optional)", value=str(MODEL_DIR))
+st.sidebar.markdown("If your team fine-tuned a model, point this to the model dir to use it.")
+
+st.header("1) Provide Resume / LinkedIn")
+uploaded = st.file_uploader("Upload your resume (PDF/DOCX/TXT). If you want, paste LinkedIn profile below.", type=['pdf','docx','doc','txt'])
+resume_text = ""
+if uploaded:
+    resume_text = extract_text_from_upload(uploaded)
+    st.success("Resume uploaded and parsed.")
+else:
+    linkedin = st.text_area("Or paste LinkedIn profile / CV text (leave blank if uploading file)", height=180)
+    if linkedin.strip():
+        resume_text = linkedin.strip()
+
+if resume_text:
+    st.markdown("**Parsed resume preview (first 400 chars):**")
+    st.write(resume_text[:1000] + ("..." if len(resume_text)>1000 else ""))
+
+st.header("2) Provide Job Description")
+jd_input = st.text_area("Paste the job description or upload a JD", height=260)
+if not jd_input:
+    st.info("Tip: paste the full job description or link (paste text). For best results include responsibilities & requirements.")
+
+st.header("3) Tailoring options")
+name = st.text_input("Your name (optional)")
+target_role = st.text_input("Target role / title (e.g. 'Frontend Engineer')")
+company = st.text_input("Company name (optional)")
+extra_instructions = st.text_area("Extra instructions for tailoring (tone, must-include keywords, metrics to emphasize)", height=80)
+
+if st.button("Generate tailored resume & cover letter"):
+    if not resume_text or not jd_input:
+        st.error("Please provide both resume (or LinkedIn) and job description.")
     else:
-        candidate_text = read_text_file(resume_file)
+        with st.spinner("Analyzing & tailoring..."):
+            # Extract skills
+            detected_skills = simple_skill_extraction(resume_text, COMMON_SKILLS)
+            relevant_sents = highlight_relevant_sentences(resume_text, jd_input, top_k=6)
 
-if not candidate_text and linked_text:
-    candidate_text = linked_text
+            # Prepare suggestions
+            suggested_bullets = []
+            for s in relevant_sents:
+                # create short bullet if too long
+                b = s.strip()
+                if len(b) > 180:
+                    b = b[:177] + "..."
+                suggested_bullets.append(b)
+            if not suggested_bullets:
+                suggested_bullets = ["Delivered X result using Y", "Improved process by N% through Z", "Led a team of X to achieve Y"]
 
-st.subheader("2) Job Description")
-jd_col1, jd_col2 = st.columns(2)
-with jd_col1:
-    job_desc = st.text_area("Paste job description", height=220)
-with jd_col2:
-    jd_file = st.file_uploader("Or upload JD (PDF/TXT)", type=["pdf", "txt"])
-    if jd_file is not None and not job_desc:
-        if jd_file.name.lower().endswith('.pdf'):
-            job_desc = extract_text_from_pdf(jd_file)
-        else:
-            job_desc = read_text_file(jd_file)
+            tailored_summary = ""
+            generated_cover_letter = ""
 
-st.subheader("3) Controls")
-cc1, cc2, cc3, cc4 = st.columns(4)
-with cc1:
-    tone = st.selectbox("Tone", [
-        "professional", "confident", "friendly", "enthusiastic", "formal", "concise",
-    ], index=0 if not selected_preset else 0)
-with cc2:
-    industry = st.text_input("Industry", value=preset_choice)
-with cc3:
-    role = st.text_input("Target Role", value="Software Engineer")
-with cc4:
-    seniority = st.selectbox("Seniority", ["Intern", "Junior", "Mid", "Senior", "Lead", "Manager"], index=2)
+            if use_local_llm and Path(fine_tune_path).exists() and TRANSFORMERS_AVAILABLE:
+                try:
+                    prompt = build_tailoring_prompt(resume_text, jd_input, name, target_role, tone, extra_instructions)
+                    llm_out = call_local_llm(prompt, Path(fine_tune_path), max_length=512)
+                    # naive parse if the model followed headings
+                    if "RESUME_SUMMARY" in llm_out:
+                        parts = re.split(r'RESUME_SUMMARY|RESUME_SUMMARY|COVER_LETTER|SUGGESTED_BULLETS', llm_out)
+                        # fallback simple
+                        tailored_summary = llm_out[:600]
+                        generated_cover_letter = llm_out[:1000]
+                    else:
+                        # use whole output for cover letter and summary fallback
+                        tailored_summary = llm_out[:400]
+                        generated_cover_letter = llm_out[400:1400]
+                except Exception as e:
+                    st.warning(f"Local LLM generation failed: {e}. Falling back to template mode.")
+                    tailored_summary = f"{target_role} with experience in {', '.join(detected_skills[:4])}."
+                    generated_cover_letter = generate_template_cover_letter(name, target_role, company, detected_skills, tone, suggested_bullets[:3])
+            else:
+                # Template / deterministic fallback
+                tailored_summary = f"{target_role} with experience in {', '.join(detected_skills[:5])} who has a strong track record delivering results aligned to the job description."
+                generated_cover_letter = generate_template_cover_letter(name or "Candidate", target_role, company, detected_skills, tone, suggested_bullets[:3])
 
-lc1, lc2, lc3 = st.columns(3)
-with lc1:
-    locale = st.selectbox("Locale", ["US", "UK", "India", "EU"], index=2)
-with lc2:
-    extra_keywords = st.text_input("Extra keywords (comma-separated)", value=", ".join(selected_preset.get("keywords", [])))
-with lc3:
-    anonymize = st.checkbox("Anonymize PII", value=False)
+            # Show results
+            st.subheader("Tailored Resume Summary")
+            st.write(tailored_summary)
 
-style_overrides = st.text_area(
-    "Style overrides (optional)",
-    value=selected_preset.get("style", ""),
-    placeholder="e.g., Use strong action verbs, 1-2 lines per bullet, include metrics, ATS-friendly formatting.",
-)
+            st.subheader("Suggested bullet points to add to your resume")
+            for b in suggested_bullets[:6]:
+                st.markdown(f"- {b}")
 
-st.divider()
+            st.subheader("Tailored Cover Letter")
+            st.write(generated_cover_letter)
 
-# Action buttons
-b1, b2, b3 = st.columns([1,1,1])
-with b1:
-    analyze = st.button("Analyze Fit")
-with b2:
-    tailor_resume = st.button("Tailor Resume")
-with b3:
-    gen_cover = st.button("Generate Cover Letter")
+            # Create downloadable docx resume
+            docx_bytes = create_docx_resume(resume_text, tailored_summary, suggested_bullets[:6])
+            st.markdown(make_download_link(docx_bytes, "tailored_resume.docx", "📥 Download tailored resume (DOCX)"), unsafe_allow_html=True)
 
-if not candidate_text:
-    st.info("Upload a resume or paste profile text to begin.")
-if not job_desc:
-    st.info("Paste or upload a job description to tailor outputs.")
+            # Cover letter download
+            cl_bytes = generated_cover_letter.encode("utf-8")
+            st.markdown(make_download_link(cl_bytes, "cover_letter.txt", "📥 Download cover letter (TXT)"), unsafe_allow_html=True)
 
-# Perform generation if requested
-generated_md = ""
-if (analyze or tailor_resume or gen_cover) and candidate_text and job_desc:
-    with st.spinner("Generating with LLM..."):
-        req = GenerationRequest(
-            candidate_text=candidate_text,
-            job_text=job_desc,
-            tone=tone,
-            industry=industry,
-            role=role,
-            seniority=seniority,
-            locale=locale,
-            extra_keywords=[k.strip() for k in extra_keywords.split(',') if k.strip()],
-            style_overrides=style_overrides,
-            anonymize=anonymize,
-        )
-        try:
-            generated_md = generate_outputs(req)
-        except Exception as e:
-            st.error(str(e))
+            st.success("Done — review and tweak any outputs before sending to employers.")
 
-if generated_md:
-    resume_md, cover_md = split_outputs(generated_md)
+st.markdown("---")
+st.markdown("**Notes & tips**: The app runs entirely locally. To enable a richer LLM-driven tailoring, download a seq2seq model (e.g. Flan-T5) and place it under `models/generator` (or point the sidebar to your fine-tuned model path). If no model is present the app uses deterministic templates + matching which works offline and reliably.")
 
-    st.subheader("🔎 Fit Analysis & Drafts")
-    tabs = st.tabs(["Tailored Resume", "Cover Letter", "Raw Markdown"])
-    with tabs[0]:
-        st.markdown(resume_md)
-        r_docx = to_docx(resume_md)
-        st.download_button(
-            label="Download Resume (DOCX)",
-            data=r_docx,
-            file_name="tailored_resume.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            disabled=not bool(r_docx),
-        )
-        st.download_button(
-            label="Download Resume (Markdown)",
-            data=resume_md.encode("utf-8"),
-            file_name="tailored_resume.md",
-            mime="text/markdown",
-        )
-    with tabs[1]:
-        st.markdown(cover_md)
-        c_docx = to_docx(cover_md)
-        st.download_button(
-            label="Download Cover Letter (DOCX)",
-            data=c_docx,
-            file_name="cover_letter.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            disabled=not bool(c_docx),
-        )
-        st.download_button(
-            label="Download Cover Letter (Markdown)",
-            data=cover_md.encode("utf-8"),
-            file_name="cover_letter.md",
-            mime="text/markdown",
-        )
-    with tabs[2]:
-        st.code(generated_md, language="markdown")
 
-st.divider()
-with st.expander("📦 requirements.txt (copy into a file and `pip install -r requirements.txt`)"):
-    st.code(
-        """
-streamlit>=1.36.0
-openai>=1.40.0
-pdfminer.six>=20231228
-python-docx>=1.1.0
-# Optional for Google AI Studio
-google-generativeai>=0.8.3
-        """.strip(),
-        language="text",
-    )
-
-with st.expander("🧪 Example Team Presets JSON (upload in sidebar to override defaults)"):
-    st.code(
-        json.dumps(
-            {
-                "FinTech Engineering": {
-                    "tone": "professional",
-                    "style": "Security-first, regulated env, latency & reliability metrics",
-                    "keywords": ["KYC", "PCI-DSS", "Latency", "Throughput", "Kafka", "Event-driven"],
-                },
-                "Healthcare Data Science": {
-                    "tone": "empathetic",
-                    "style": "HIPAA, PHI handling, outcome metrics, clinical collaboration",
-                    "keywords": ["FHIR", "HL7", "PHI", "De-identification", "Survival Analysis"],
-                },
-            },
-            indent=2,
-        ),
-        language="json",
-    )
-
-with st.expander("🔐 Notes on Privacy & PII"):
-    st.markdown(
-        "- All processing happens through the selected LLM provider; do not paste sensitive data you cannot share.\n"
-        "- Use the **Anonymize PII** toggle to scrub names, emails, and phone numbers in outputs.\n"
-        "- Review drafts for accuracy before sending to employers.\n"
-    )
 
 
