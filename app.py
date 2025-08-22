@@ -29,6 +29,7 @@ share the same UI.
 import io
 import json
 import os
+import openai
 import re
 import time
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 
 # -------- Optional LLM providers --------
+openai.api_key = os.getenv("OPENAI_API_KEY")
 PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()  # "openai" or "google"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 GOOGLE_MODEL = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash-exp")
@@ -538,4 +540,5 @@ with st.expander("🔐 Notes on Privacy & PII"):
         "- Use the **Anonymize PII** toggle to scrub names, emails, and phone numbers in outputs.\n"
         "- Review drafts for accuracy before sending to employers.\n"
     )
+
 
