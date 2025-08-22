@@ -1,8 +1,11 @@
-streamlit==1.26.0
-fpdf2==2.6.1
-transformers==4.40.0
-torch==2.2.0   # Older version more compatible
-nltk==3.8.1
-python-docx==0.8.12
-requests==2.31.0
+streamlit
+pdfplumber
+python-docx
+jinja2
+pdfkit
+requests
+pandas
+streamlit-forms
+streamlit-option-menu
+
 
