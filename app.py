@@ -1,171 +1,175 @@
+# app.py
 import streamlit as st
 from io import BytesIO
+from fpdf import FPDF
 import base64
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-import razorpay
+import os
+import json
+from pathlib import Path
 
-# ---------- CUSTOM CSS ----------
+# Optional AI libraries (transformers, openai, etc.)
+try:
+    from transformers import pipeline
+    ai_pipeline_available = True
+except:
+    ai_pipeline_available = False
+
+# --- APP CONFIG ---
+st.set_page_config(page_title="AI Resume & Cover Letter Generator", page_icon=":briefcase:", layout="centered")
+
+# --- CSS STYLING ---
 st.markdown("""
 <style>
-/* App background */
-.stApp {
-    background: linear-gradient(180deg, #eef4ff, #ffffff);
-    font-family: 'Segoe UI', sans-serif;
-}
-/* Header */
-.header {
-    font-size: 34px;
-    font-weight: bold;
-    color: #003366;
-    padding: 15px 0;
-    text-align: center;
-}
-/* Section container */
-.section {
-    background-color: white;
-    padding: 25px;
-    border-radius: 14px;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.06);
-    margin-bottom: 25px;
-    transition: all 0.3s ease;
-}
-.section:hover {
-    box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-    transform: translateY(-2px);
-}
-/* Buttons */
-.stButton button {
-    background: linear-gradient(90deg, #00509e, #0073e6);
-    color: white;
-    border-radius: 10px;
-    padding: 0.6rem 1.2rem;
-    border: none;
-    transition: all 0.3s ease;
-    font-weight: bold;
-}
-.stButton button:hover {
-    background: linear-gradient(90deg, #0073e6, #00509e);
-    transform: scale(1.05);
-}
-/* Download link */
-a.download-link {
-    display: inline-block;
-    background: linear-gradient(90deg, #28a745, #218838);
-    color: white;
-    padding: 10px 20px;
-    border-radius: 8px;
-    text-decoration: none;
-    font-weight: bold;
-    transition: all 0.3s ease;
-}
-a.download-link:hover {
-    background: linear-gradient(90deg, #218838, #28a745);
-    transform: scale(1.05);
-}
-/* Premium badge */
-.premium-badge {
-    display: inline-block;
-    background: gold;
+/* Golden premium button */
+.premium-btn {
+    background-color: #FFD700;
     color: black;
-    padding: 5px 12px;
-    border-radius: 20px;
     font-weight: bold;
-    font-size: 0.85rem;
-    margin-left: 10px;
+    font-size: 18px;
+    padding: 10px 20px;
+    border-radius: 12px;
+    text-align: center;
+    display: inline-block;
+    cursor: pointer;
+    margin: 10px 0;
 }
+
+/* Dark / Light mode toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 60px;
+  height: 34px;
+}
+.switch input {display:none;}
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top:0;
+  left:0;
+  right:0;
+  bottom:0;
+  background-color:#ccc;
+  transition: .4s;
+  border-radius: 34px;
+}
+.slider:before {
+  position: absolute;
+  content:"";
+  height:26px;
+  width:26px;
+  left:4px;
+  bottom:4px;
+  background-color:white;
+  transition:.4s;
+  border-radius:50%;
+}
+input:checked + .slider {background-color:#2196F3;}
+input:checked + .slider:before {transform: translateX(26px);}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- PDF GENERATOR FUNCTION ----------
-def generate_pdf(name, email, phone, skills, experience):
-    buffer = BytesIO()
-    p = canvas.Canvas(buffer, pagesize=letter)
-    width, height = letter
+# --- THEME TOGGLE ---
+theme_choice = st.radio("Select Theme:", ["Light", "Dark"])
+if theme_choice == "Dark":
+    st.markdown('<style>body {background-color: #0e1117; color: white;}</style>', unsafe_allow_html=True)
+else:
+    st.markdown('<style>body {background-color: white; color: black;}</style>', unsafe_allow_html=True)
 
-    # HEADER
-    p.setFillColor(colors.HexColor("#003366"))
-    p.rect(0, height - 80, width, 80, fill=True, stroke=False)
-    p.setFillColor(colors.white)
-    p.setFont("Helvetica-Bold", 24)
-    p.drawString(50, height - 50, name)
+st.title("🤖 AI-Powered Resume & Cover Letter Generator")
 
-    # CONTACT INFO
-    p.setFillColor(colors.HexColor("#00509e"))
-    p.rect(0, height - 100, width, 20, fill=True, stroke=False)
-    p.setFillColor(colors.white)
-    p.setFont("Helvetica", 10)
-    p.drawString(50, height - 95, f"Email: {email}  |  Phone: {phone}")
+# --- UPLOAD / LINKEDIN ---
+st.header("Upload Your Resume or LinkedIn Profile")
+resume_file = st.file_uploader("Upload Resume (PDF/DOCX):", type=["pdf", "docx"])
+linkedin_url = st.text_input("Or paste LinkedIn Profile URL:")
 
-    y = height - 140
+# --- JOB DESCRIPTION ---
+job_description = st.text_area("Paste Job Description Here:")
 
-    # SKILLS SECTION
-    p.setFillColor(colors.HexColor("#e6f0ff"))
-    p.rect(40, y - 20, width - 80, 20, fill=True, stroke=False)
-    p.setFillColor(colors.HexColor("#003366"))
-    p.setFont("Helvetica-Bold", 14)
-    p.drawString(50, y - 15, "Skills")
-    y -= 40
-    p.setFillColor(colors.black)
-    p.setFont("Helvetica", 12)
-    for skill in skills.split(","):
-        p.drawString(60, y, f"• {skill.strip()}")
-        y -= 15
-
-    # EXPERIENCE SECTION
-    y -= 20
-    p.setFillColor(colors.HexColor("#e6f0ff"))
-    p.rect(40, y - 20, width - 80, 20, fill=True, stroke=False)
-    p.setFillColor(colors.HexColor("#003366"))
-    p.setFont("Helvetica-Bold", 14)
-    p.drawString(50, y - 15, "Experience")
-    y -= 40
-    p.setFillColor(colors.black)
-    p.setFont("Helvetica", 12)
-    for exp in experience.split("\n"):
-        p.drawString(60, y, f"• {exp.strip()}")
-        y -= 15
-
-    p.showPage()
-    p.save()
-    buffer.seek(0)
-    return buffer
-
-# ---------- RAZORPAY SETUP ----------
-razorpay_client = razorpay.Client(auth=("YOUR_RAZORPAY_KEY_ID", "YOUR_RAZORPAY_SECRET"))
-
-# ---------- APP HEADER ----------
-st.markdown('<div class="header">AI Resume Generator <span class="premium-badge">Premium</span></div>', unsafe_allow_html=True)
-
-# ---------- USER FORM ----------
-with st.form("resume_form"):
-    st.markdown('<div class="section">', unsafe_allow_html=True)
-    name = st.text_input("Full Name")
+# --- CUSTOM RESUME GENERATION ---
+st.header("Generate Resume From Details")
+with st.expander("Enter Your Details"):
+    full_name = st.text_input("Full Name")
     email = st.text_input("Email")
-    phone = st.text_input("Phone")
-    skills = st.text_area("Skills (comma separated)")
-    experience = st.text_area("Experience (each on a new line)")
-    st.markdown('</div>', unsafe_allow_html=True)
-    submitted = st.form_submit_button("Generate Resume")
+    phone = st.text_input("Phone Number")
+    education = st.text_area("Education")
+    experience = st.text_area("Experience")
+    skills = st.text_area("Skills")
+    achievements = st.text_area("Achievements")
+    interests = st.text_area("Interests / Extra-Curriculars")
 
-if submitted:
-    pdf_buffer = generate_pdf(name, email, phone, skills, experience)
-    b64 = base64.b64encode(pdf_buffer.read()).decode()
-    href = f'<a href="data:application/pdf;base64,{b64}" download="resume.pdf" class="download-link">📄 Download Resume</a>'
+# --- PREMIUM PAYMENT BUTTON (RAZORPAY) ---
+st.markdown('<div class="premium-btn" id="premium-btn">Upgrade to Premium</div>', unsafe_allow_html=True)
+
+# Razorpay Integration
+razorpay_key = "YOUR_RAZORPAY_KEY"  # Replace with your Razorpay API key
+premium_script = f"""
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+var btn = document.getElementById('premium-btn');
+btn.onclick = function(e){{
+    var options = {{
+        "key": "{razorpay_key}",
+        "amount": 49900,  // 499 INR
+        "currency": "INR",
+        "name": "AI Resume Generator Premium",
+        "description": "Premium subscription",
+        "handler": function(response){{
+            document.querySelector("#payment_status").innerText = "✅ Payment Successful! Premium features unlocked.";
+        }},
+        "theme": {{
+            "color": "#F37254"
+        }}
+    }};
+    var rzp1 = new Razorpay(options);
+    rzp1.open();
+    e.preventDefault();
+}};
+</script>
+<div id="payment_status" style="color:green;font-weight:bold;margin-top:10px;"></div>
+"""
+st.components.v1.html(premium_script, height=150)
+
+# --- GENERATE RESUME BUTTON ---
+if st.button("Generate Resume PDF"):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, full_name, ln=True, align="C")
+    pdf.set_font("Arial", "", 12)
+    pdf.ln(5)
+    pdf.multi_cell(0, 8, f"Email: {email}\nPhone: {phone}\n\nEducation:\n{education}\n\nExperience:\n{experience}\n\nSkills:\n{skills}\n\nAchievements:\n{achievements}\n\nInterests:\n{interests}")
+    pdf_buffer = BytesIO()
+    pdf.output(pdf_buffer)
+    pdf_bytes = pdf_buffer.getvalue()
+
+    # Download link
+    b64 = base64.b64encode(pdf_bytes).decode()
+    href = f'<a href="data:application/octet-stream;base64,{b64}" download="resume.pdf">📄 Download Your Resume PDF</a>'
     st.markdown(href, unsafe_allow_html=True)
 
-# ---------- PREMIUM UPGRADE BUTTON ----------
-if st.button("Upgrade to Premium 💳"):
-    order = razorpay_client.order.create({
-        "amount": 50000,  # amount in paise (500 INR)
-        "currency": "INR",
-        "payment_capture": "1"
-    })
-    st.write(f"Click the link below to pay via Razorpay:")
-    st.markdown(f"[Pay Now](https://rzp.io/i/{order['id']})")
+# --- AI COVER LETTER / RESUME GENERATION (PREMIUM) ---
+if st.button("Generate AI-Tailored Resume & Cover Letter"):
+    if not job_description:
+        st.warning("Please enter a job description first!")
+    else:
+        st.info("Generating AI resume & cover letter...")
+        if ai_pipeline_available:
+            # Example using a summarization / text generation model
+            generator = pipeline("text2text-generation", model="google/flan-t5-small")
+            prompt_resume = f"Optimize this resume for the following job description:\n{job_description}\n\nResume Info:\nName: {full_name}\nExperience: {experience}\nSkills: {skills}\nAchievements: {achievements}"
+            ai_resume = generator(prompt_resume, max_length=500)[0]['generated_text']
 
+            prompt_cover_letter = f"Generate a professional cover letter for the following job description:\n{job_description}\n\nCandidate Name: {full_name}\nExperience: {experience}\nSkills: {skills}\nAchievements: {achievements}"
+            ai_cover_letter = generator(prompt_cover_letter, max_length=500)[0]['generated_text']
 
+            st.subheader("AI-Tailored Resume")
+            st.text(ai_resume)
+            st.subheader("AI-Generated Cover Letter")
+            st.text(ai_cover_letter)
+        else:
+            st.warning("AI libraries not installed. Please install 'transformers' and restart the app.")
 
-
+st.markdown("---")
+st.markdown("Developed with ❤️ using Streamlit | Premium payments via Razorpay integration")
 
