@@ -1,6 +1,7 @@
-streamlit>=1.36.0
-openai>=1.40.0
-pdfminer.six>=20231228
-python-docx>=1.1.0
-# Optional for Google AI Studio support
-google-generativeai>=0.8.3
+streamlit>=1.20.0
+pdfplumber
+python-docx
+transformers>=4.30.0    # optional; required for local LLM mode
+sentence-transformers  # optional; required for semantic matching
+torch                  # optional; required for running local transformers
+sentencepiece          # sometimes required by tokenizer models
