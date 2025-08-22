@@ -1,12 +1,10 @@
-streamlit>=1.20.0
-pdfplumber
-python-docx
-transformers>=4.30.0    # optional; required for local LLM mode
-sentence-transformers  # optional; required for semantic matching
-torch                  # optional; required for running local transformers
-sentencepiece          # sometimes required by tokenizer models
-streamlit
-reportlab
-razorpay
-
-
+streamlit==1.26.0
+fpdf2==2.6.1
+transformers==4.40.0
+torch==2.3.0
+sentence-transformers==2.2.2
+nltk==3.8.1
+pdfplumber==0.10.1
+python-docx==0.8.12
+fsspec==2025.1.0
+requests==2.31.0
